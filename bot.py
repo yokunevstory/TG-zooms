@@ -24,7 +24,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_ID = int(os.environ["OWNER_ID"])
 DB_PATH = os.environ.get("DB_PATH", "broadcasts.db")
 
-NAME, DATE, TIME_STATE, LINK = range(4)
+NAME, DATE, TIME_STATE, LINK, CHAT_INPUT = range(5)
 
 scheduler = AsyncIOScheduler(timezone=TIMEZONE)
 
@@ -40,21 +40,26 @@ def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS broadcasts (
-                id      INTEGER PRIMARY KEY AUTOINCREMENT,
-                name    TEXT NOT NULL,
-                date    TEXT NOT NULL,
-                time    TEXT NOT NULL,
-                link    TEXT NOT NULL,
-                chat_id INTEGER NOT NULL
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                name           TEXT NOT NULL,
+                date           TEXT NOT NULL,
+                time           TEXT NOT NULL,
+                link           TEXT NOT NULL,
+                chat_id        INTEGER NOT NULL,
+                target_chat_id INTEGER NOT NULL DEFAULT 0
             )
         """)
+        # Migration: add target_chat_id to existing databases
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(broadcasts)").fetchall()]
+        if "target_chat_id" not in cols:
+            conn.execute("ALTER TABLE broadcasts ADD COLUMN target_chat_id INTEGER NOT NULL DEFAULT 0")
 
 
-def db_add(name, date, time, link, chat_id) -> int:
+def db_add(name, date, time, link, chat_id, target_chat_id) -> int:
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.execute(
-            "INSERT INTO broadcasts (name, date, time, link, chat_id) VALUES (?, ?, ?, ?, ?)",
-            (name, date, time, link, chat_id),
+            "INSERT INTO broadcasts (name, date, time, link, chat_id, target_chat_id) VALUES (?, ?, ?, ?, ?, ?)",
+            (name, date, time, link, chat_id, target_chat_id),
         )
         return cur.lastrowid
 
@@ -97,6 +102,18 @@ def owner_only(func):
     return wrapper
 
 
+def extract_forwarded_chat_id(message) -> int | None:
+    """Extract chat ID from a forwarded message (channel or group)."""
+    origin = getattr(message, "forward_origin", None)
+    if origin and hasattr(origin, "chat"):
+        return origin.chat.id
+    # Fallback for older API versions
+    fwd_chat = getattr(message, "forward_from_chat", None)
+    if fwd_chat:
+        return fwd_chat.id
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Reminder senders
 # ---------------------------------------------------------------------------
@@ -104,9 +121,9 @@ def owner_only(func):
 async def send_morning(bot, broadcast_id: int):
     row = db_get(broadcast_id)
     if row:
-        _, name, date, time, link, chat_id = row
+        id_, name, date, time, link, chat_id, target_chat_id = row
         await bot.send_message(
-            chat_id,
+            target_chat_id,
             f"Привет! Сегодня у нас трансляция: «{name}», {time}\n{link}",
         )
 
@@ -114,15 +131,15 @@ async def send_morning(bot, broadcast_id: int):
 async def send_hour(bot, broadcast_id: int):
     row = db_get(broadcast_id)
     if row:
-        _, name, date, time, link, chat_id = row
-        await bot.send_message(chat_id, f"Трансляция «{name}» через час!\n{link}")
+        id_, name, date, time, link, chat_id, target_chat_id = row
+        await bot.send_message(target_chat_id, f"Трансляция «{name}» через час!\n{link}")
 
 
 async def send_15min(bot, broadcast_id: int):
     row = db_get(broadcast_id)
     if row:
-        _, name, date, time, link, chat_id = row
-        await bot.send_message(chat_id, f"Трансляция «{name}» через 15 минут!\n{link}")
+        id_, name, date, time, link, chat_id, target_chat_id = row
+        await bot.send_message(target_chat_id, f"Трансляция «{name}» через 15 минут!\n{link}")
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +183,7 @@ async def post_init(app: Application):
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute("SELECT * FROM broadcasts").fetchall()
     for row in rows:
-        id_, name, date, time, link, chat_id = row
+        id_, name, date, time, link, chat_id, target_chat_id = row
         if parse_dt(date, time) > now:
             schedule_jobs(app.bot, id_, date, time)
     scheduler.start()
@@ -227,13 +244,38 @@ async def step_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def step_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["link"] = update.message.text.strip()
+    await update.message.reply_text(
+        "Укажите чат для публикации — перешлите любое сообщение из нужной группы/канала "
+        "или введите ID чата вручную (например: -1001234567890)."
+    )
+    return CHAT_INPUT
+
+
+async def step_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+
+    # Try to get chat ID from a forwarded message first
+    target_chat_id = extract_forwarded_chat_id(message)
+
+    # Otherwise parse it as a plain number
+    if target_chat_id is None:
+        try:
+            target_chat_id = int(message.text.strip())
+        except (ValueError, AttributeError):
+            await message.reply_text(
+                "Не понял. Перешлите любое сообщение из нужной группы/канала "
+                "или введите ID чата числом:"
+            )
+            return CHAT_INPUT
+
     name = context.user_data["name"]
     date = context.user_data["date"]
     time = context.user_data["time"]
-    link = update.message.text.strip()
-    chat_id = update.effective_chat.id
+    link = context.user_data["link"]
+    owner_chat_id = update.effective_chat.id
 
-    broadcast_id = db_add(name, date, time, link, chat_id)
+    broadcast_id = db_add(name, date, time, link, owner_chat_id, target_chat_id)
     schedule_jobs(context.bot, broadcast_id, date, time)
 
     now = datetime.now(TIMEZONE)
@@ -250,11 +292,12 @@ async def step_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     reminders_text = "\n".join(reminders) if reminders else "нет (все напоминания уже прошли)"
 
-    await update.message.reply_text(
+    await message.reply_text(
         f"Готово!\n\n"
         f"Название: {name}\n"
         f"Дата: {date} в {time}\n"
-        f"Ссылка: {link}\n\n"
+        f"Ссылка: {link}\n"
+        f"Чат публикации: {target_chat_id}\n\n"
         f"Напоминания:\n{reminders_text}"
     )
     return ConversationHandler.END
@@ -275,9 +318,13 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(TIMEZONE)
     lines = ["Трансляции:\n"]
     for row in rows:
-        id_, name, date, time, link, chat_id = row
+        id_, name, date, time, link, chat_id, target_chat_id = row
         status = "впереди" if parse_dt(date, time) > now else "прошла"
-        lines.append(f"[{id_}] «{name}» — {date} в {time} ({status})\n{link}\n")
+        lines.append(
+            f"[{id_}] «{name}» — {date} в {time} ({status})\n"
+            f"Чат: {target_chat_id}\n"
+            f"{link}\n"
+        )
 
     await update.message.reply_text("\n".join(lines))
 
@@ -337,6 +384,7 @@ def main():
             DATE:       [MessageHandler(filters.TEXT & ~filters.COMMAND, step_date)],
             TIME_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, step_time)],
             LINK:       [MessageHandler(filters.TEXT & ~filters.COMMAND, step_link)],
+            CHAT_INPUT: [MessageHandler(filters.ALL & ~filters.COMMAND, step_chat)],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
     )
