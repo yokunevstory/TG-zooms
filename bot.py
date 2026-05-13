@@ -34,6 +34,9 @@ scheduler = AsyncIOScheduler(timezone=TIMEZONE)
 # ---------------------------------------------------------------------------
 
 def init_db():
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS broadcasts (
