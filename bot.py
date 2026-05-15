@@ -10,8 +10,6 @@ from telegram.ext import (
     filters, ContextTypes, ConversationHandler,
     CallbackQueryHandler,
 )
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.date import DateTrigger
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -25,8 +23,6 @@ OWNER_ID = int(os.environ["OWNER_ID"])
 DB_PATH = os.environ.get("DB_PATH", "broadcasts.db")
 
 NAME, DATE, TIME_STATE, LINK, CHAT_INPUT = range(5)
-
-scheduler = AsyncIOScheduler(timezone=TIMEZONE)
 
 
 # ---------------------------------------------------------------------------
@@ -46,27 +42,37 @@ def init_db():
                 time           TEXT NOT NULL,
                 link           TEXT NOT NULL,
                 chat_id        INTEGER NOT NULL,
-                target_chat_id INTEGER NOT NULL DEFAULT 0
+                target_chat_id INTEGER NOT NULL DEFAULT 0,
+                sent_morning   INTEGER NOT NULL DEFAULT 0,
+                sent_hour      INTEGER NOT NULL DEFAULT 0,
+                sent_15min     INTEGER NOT NULL DEFAULT 0
             )
         """)
-        # Migration: add target_chat_id to existing databases
+        # Migration: add missing columns to existing databases
         cols = [r[1] for r in conn.execute("PRAGMA table_info(broadcasts)").fetchall()]
-        if "target_chat_id" not in cols:
-            conn.execute("ALTER TABLE broadcasts ADD COLUMN target_chat_id INTEGER NOT NULL DEFAULT 0")
+        for col, definition in [
+            ("target_chat_id", "INTEGER NOT NULL DEFAULT 0"),
+            ("sent_morning",   "INTEGER NOT NULL DEFAULT 0"),
+            ("sent_hour",      "INTEGER NOT NULL DEFAULT 0"),
+            ("sent_15min",     "INTEGER NOT NULL DEFAULT 0"),
+        ]:
+            if col not in cols:
+                conn.execute(f"ALTER TABLE broadcasts ADD COLUMN {col} {definition}")
 
 
 def db_add(name, date, time, link, chat_id, target_chat_id) -> int:
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.execute(
-            "INSERT INTO broadcasts (name, date, time, link, chat_id, target_chat_id) VALUES (?, ?, ?, ?, ?, ?)",
+            """INSERT INTO broadcasts (name, date, time, link, chat_id, target_chat_id)
+               VALUES (?, ?, ?, ?, ?, ?)""",
             (name, date, time, link, chat_id, target_chat_id),
         )
         return cur.lastrowid
 
 
-def db_get(broadcast_id):
+def db_all():
     with sqlite3.connect(DB_PATH) as conn:
-        return conn.execute("SELECT * FROM broadcasts WHERE id = ?", (broadcast_id,)).fetchone()
+        return conn.execute("SELECT * FROM broadcasts").fetchall()
 
 
 def db_list(chat_id):
@@ -74,6 +80,11 @@ def db_list(chat_id):
         return conn.execute(
             "SELECT * FROM broadcasts WHERE chat_id = ? ORDER BY date, time", (chat_id,)
         ).fetchall()
+
+
+def db_mark_sent(broadcast_id: int, column: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(f"UPDATE broadcasts SET {column} = 1 WHERE id = ?", (broadcast_id,))
 
 
 def db_delete(broadcast_id, chat_id) -> bool:
@@ -103,11 +114,9 @@ def owner_only(func):
 
 
 def extract_forwarded_chat_id(message) -> int | None:
-    """Extract chat ID from a forwarded message (channel or group)."""
     origin = getattr(message, "forward_origin", None)
     if origin and hasattr(origin, "chat"):
         return origin.chat.id
-    # Fallback for older API versions
     fwd_chat = getattr(message, "forward_from_chat", None)
     if fwd_chat:
         return fwd_chat.id
@@ -115,79 +124,46 @@ def extract_forwarded_chat_id(message) -> int | None:
 
 
 # ---------------------------------------------------------------------------
-# Reminder senders
+# Reminder poller (runs every 60 seconds via JobQueue)
 # ---------------------------------------------------------------------------
 
-async def send_morning(bot, broadcast_id: int):
-    row = db_get(broadcast_id)
-    if row:
-        id_, name, date, time, link, chat_id, target_chat_id = row
-        await bot.send_message(
-            target_chat_id,
-            f"Привет! Сегодня у нас трансляция: «{name}», {time}\n{link}",
-        )
-
-
-async def send_hour(bot, broadcast_id: int):
-    row = db_get(broadcast_id)
-    if row:
-        id_, name, date, time, link, chat_id, target_chat_id = row
-        await bot.send_message(target_chat_id, f"Трансляция «{name}» через час!\n{link}")
-
-
-async def send_15min(bot, broadcast_id: int):
-    row = db_get(broadcast_id)
-    if row:
-        id_, name, date, time, link, chat_id, target_chat_id = row
-        await bot.send_message(target_chat_id, f"Трансляция «{name}» через 15 минут!\n{link}")
-
-
-# ---------------------------------------------------------------------------
-# Scheduling
-# ---------------------------------------------------------------------------
-
-def schedule_jobs(bot, broadcast_id: int, date_str: str, time_str: str):
+async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(TIMEZONE)
-    broadcast_dt = parse_dt(date_str, time_str)
+    rows = db_all()
 
-    jobs = {
-        f"morning_{broadcast_id}": (
-            broadcast_dt.replace(hour=9, minute=0, second=0, microsecond=0),
-            send_morning,
-        ),
-        f"hour_{broadcast_id}": (broadcast_dt - timedelta(hours=1), send_hour),
-        f"min15_{broadcast_id}": (broadcast_dt - timedelta(minutes=15), send_15min),
-    }
-
-    for job_id, (run_at, func) in jobs.items():
-        if run_at > now:
-            scheduler.add_job(
-                func,
-                DateTrigger(run_date=run_at),
-                args=[bot, broadcast_id],
-                id=job_id,
-                replace_existing=True,
-            )
-
-
-def remove_jobs(broadcast_id: int):
-    for job_id in [f"morning_{broadcast_id}", f"hour_{broadcast_id}", f"min15_{broadcast_id}"]:
-        try:
-            scheduler.remove_job(job_id)
-        except Exception:
-            pass
-
-
-async def post_init(app: Application):
-    now = datetime.now(TIMEZONE)
-    with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute("SELECT * FROM broadcasts").fetchall()
     for row in rows:
-        id_, name, date, time, link, chat_id, target_chat_id = row
-        if parse_dt(date, time) > now:
-            schedule_jobs(app.bot, id_, date, time)
-    scheduler.start()
-    logger.info("Scheduler started, %d broadcast(s) loaded.", len(rows))
+        id_, name, date, time, link, chat_id, target_chat_id, sent_morning, sent_hour, sent_15min = row
+        broadcast_dt = parse_dt(date, time)
+
+        reminders = [
+            (
+                broadcast_dt.replace(hour=9, minute=0, second=0, microsecond=0),
+                sent_morning,
+                "sent_morning",
+                f"Привет! Сегодня у нас трансляция: «{name}», {time}\n{link}",
+            ),
+            (
+                broadcast_dt - timedelta(hours=1),
+                sent_hour,
+                "sent_hour",
+                f"Трансляция «{name}» через час!\n{link}",
+            ),
+            (
+                broadcast_dt - timedelta(minutes=15),
+                sent_15min,
+                "sent_15min",
+                f"Трансляция «{name}» через 15 минут!\n{link}",
+            ),
+        ]
+
+        for reminder_dt, already_sent, col, text in reminders:
+            if not already_sent and now >= reminder_dt:
+                try:
+                    await context.bot.send_message(target_chat_id, text)
+                    db_mark_sent(id_, col)
+                    logger.info("Sent %s for broadcast #%d", col, id_)
+                except Exception as e:
+                    logger.error("Failed to send %s for broadcast #%d: %s", col, id_, e)
 
 
 # ---------------------------------------------------------------------------
@@ -254,11 +230,8 @@ async def step_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def step_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
-
-    # Try to get chat ID from a forwarded message first
     target_chat_id = extract_forwarded_chat_id(message)
 
-    # Otherwise parse it as a plain number
     if target_chat_id is None:
         try:
             target_chat_id = int(message.text.strip())
@@ -275,8 +248,7 @@ async def step_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     link = context.user_data["link"]
     owner_chat_id = update.effective_chat.id
 
-    broadcast_id = db_add(name, date, time, link, owner_chat_id, target_chat_id)
-    schedule_jobs(context.bot, broadcast_id, date, time)
+    db_add(name, date, time, link, owner_chat_id, target_chat_id)
 
     now = datetime.now(TIMEZONE)
     broadcast_dt = parse_dt(date, time)
@@ -318,7 +290,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(TIMEZONE)
     lines = ["Трансляции:\n"]
     for row in rows:
-        id_, name, date, time, link, chat_id, target_chat_id = row
+        id_, name, date, time, link, chat_id, target_chat_id, *sent = row
         status = "впереди" if parse_dt(date, time) > now else "прошла"
         lines.append(
             f"[{id_}] «{name}» — {date} в {time} ({status})\n"
@@ -357,7 +329,6 @@ async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     broadcast_id = int(query.data.removeprefix("del_"))
     if db_delete(broadcast_id, update.effective_chat.id):
-        remove_jobs(broadcast_id)
         await query.edit_message_text(f"Трансляция #{broadcast_id} удалена.")
     else:
         await query.edit_message_text("Трансляция не найдена.")
@@ -370,12 +341,9 @@ async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     init_db()
 
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.job_queue.run_repeating(check_reminders, interval=300, first=10)
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("add", cmd_add)],
