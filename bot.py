@@ -48,7 +48,6 @@ def init_db():
                 sent_15min     INTEGER NOT NULL DEFAULT 0
             )
         """)
-        # Migration: add missing columns to existing databases
         cols = [r[1] for r in conn.execute("PRAGMA table_info(broadcasts)").fetchall()]
         for col, definition in [
             ("target_chat_id", "INTEGER NOT NULL DEFAULT 0"),
@@ -113,6 +112,14 @@ def owner_only(func):
     return wrapper
 
 
+async def check_owner_cb(update: Update) -> bool:
+    """Returns True if caller is owner; silently rejects otherwise."""
+    if update.effective_user.id == OWNER_ID:
+        return True
+    await update.callback_query.answer("Нет доступа.", show_alert=True)
+    return False
+
+
 def extract_forwarded_chat_id(message) -> int | None:
     origin = getattr(message, "forward_origin", None)
     if origin and hasattr(origin, "chat"):
@@ -123,8 +130,22 @@ def extract_forwarded_chat_id(message) -> int | None:
     return None
 
 
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Добавить трансляцию", callback_data="menu_add")],
+        [InlineKeyboardButton("📋 Список трансляций",   callback_data="menu_list")],
+        [InlineKeyboardButton("🗑️ Удалить трансляцию",  callback_data="menu_delete")],
+    ])
+
+
+def back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("◀️ Главное меню", callback_data="menu_back")]
+    ])
+
+
 # ---------------------------------------------------------------------------
-# Reminder poller (runs every 60 seconds via JobQueue)
+# Reminder poller (runs every 5 minutes via JobQueue)
 # ---------------------------------------------------------------------------
 
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
@@ -167,22 +188,158 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# Command handlers
+# #вопрос — forward tagged messages to owner
+# ---------------------------------------------------------------------------
+
+async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat:
+        return
+
+    chat_name = chat.title or chat.username or str(chat.id)
+
+    # Build a direct link to the message (works for public chats and supergroups)
+    msg_link = None
+    if chat.username:
+        msg_link = f"https://t.me/{chat.username}/{message.message_id}"
+    elif str(chat.id).startswith("-100"):
+        pure_id = str(chat.id)[4:]
+        msg_link = f"https://t.me/c/{pure_id}/{message.message_id}"
+
+    header = f"❓ <b>Новый вопрос</b>\nЧат: «{chat_name}» (<code>{chat.id}</code>)"
+    if msg_link:
+        header += f'\n<a href="{msg_link}">Перейти к сообщению ↗</a>'
+
+    try:
+        await context.bot.send_message(OWNER_ID, header, parse_mode="HTML")
+        await context.bot.forward_message(
+            chat_id=OWNER_ID,
+            from_chat_id=chat.id,
+            message_id=message.message_id,
+        )
+        logger.info("Forwarded question from chat %d to owner", chat.id)
+    except Exception as e:
+        logger.error("Failed to forward question from %s: %s", chat.id, e)
+
+
+# ---------------------------------------------------------------------------
+# /start — main menu
 # ---------------------------------------------------------------------------
 
 @owner_only
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привет!\n\n"
-        "/add — добавить трансляцию\n"
-        "/list — список трансляций\n"
-        "/delete — удалить трансляцию"
+        "Привет! Выберите действие:",
+        reply_markup=main_menu_keyboard(),
     )
 
+
+# ---------------------------------------------------------------------------
+# Menu callbacks
+# ---------------------------------------------------------------------------
+
+async def cb_menu_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not await check_owner_cb(update):
+        return
+    await query.answer()
+    await query.edit_message_text("Выберите действие:", reply_markup=main_menu_keyboard())
+
+
+async def cb_menu_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not await check_owner_cb(update):
+        return
+    await query.answer()
+
+    rows = db_list(update.effective_chat.id)
+    if not rows:
+        await query.edit_message_text(
+            "Нет запланированных трансляций.",
+            reply_markup=back_keyboard(),
+        )
+        return
+
+    now = datetime.now(TIMEZONE)
+    lines = ["<b>Трансляции:</b>\n"]
+    for row in rows:
+        id_, name, date, time, link, chat_id, target_chat_id, *_ = row
+        status = "впереди ✅" if parse_dt(date, time) > now else "прошла"
+        lines.append(
+            f"[{id_}] «{name}» — {date} в {time} ({status})\n"
+            f"Чат: <code>{target_chat_id}</code>\n"
+            f"{link}\n"
+        )
+
+    await query.edit_message_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=back_keyboard(),
+        disable_web_page_preview=True,
+    )
+
+
+async def cb_menu_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not await check_owner_cb(update):
+        return
+    await query.answer()
+
+    rows = db_list(update.effective_chat.id)
+    if not rows:
+        await query.edit_message_text(
+            "Нет трансляций для удаления.",
+            reply_markup=back_keyboard(),
+        )
+        return
+
+    keyboard = [
+        [InlineKeyboardButton(f"🗑 [{r[0]}] {r[1]} — {r[2]} {r[3]}", callback_data=f"del_{r[0]}")]
+        for r in rows
+    ]
+    keyboard.append([InlineKeyboardButton("◀️ Главное меню", callback_data="menu_back")])
+    await query.edit_message_text(
+        "Выберите трансляцию для удаления:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not await check_owner_cb(update):
+        return
+    await query.answer()
+
+    broadcast_id = int(query.data.removeprefix("del_"))
+    if db_delete(broadcast_id, update.effective_chat.id):
+        await query.edit_message_text(
+            f"✅ Трансляция #{broadcast_id} удалена.",
+            reply_markup=main_menu_keyboard(),
+        )
+    else:
+        await query.edit_message_text(
+            "Трансляция не найдена.",
+            reply_markup=main_menu_keyboard(),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Add broadcast — conversation
+# ---------------------------------------------------------------------------
 
 @owner_only
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Введите название трансляции:")
+    return NAME
+
+
+async def cb_menu_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not await check_owner_cb(update):
+        return
+    await query.answer()
+    await query.edit_message_text("Введите название трансляции:")
     return NAME
 
 
@@ -222,8 +379,8 @@ async def step_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def step_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["link"] = update.message.text.strip()
     await update.message.reply_text(
-        "Укажите чат для публикации — перешлите любое сообщение из нужной группы/канала "
-        "или введите ID чата вручную (например: -1001234567890)."
+        "Введите ID чата для публикации напоминаний.\n\n"
+        "Не знаете ID? Напишите /chatid прямо в той группе/канале — бот пришлёт его."
     )
     return CHAT_INPUT
 
@@ -237,8 +394,7 @@ async def step_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             target_chat_id = int(message.text.strip())
         except (ValueError, AttributeError):
             await message.reply_text(
-                "Не понял. Перешлите любое сообщение из нужной группы/канала "
-                "или введите ID чата числом:"
+                "Не понял. Введите ID чата числом (например: -1001234567890):"
             )
             return CHAT_INPUT
 
@@ -265,73 +421,82 @@ async def step_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reminders_text = "\n".join(reminders) if reminders else "нет (все напоминания уже прошли)"
 
     await message.reply_text(
-        f"Готово!\n\n"
+        f"✅ <b>Трансляция добавлена!</b>\n\n"
         f"Название: {name}\n"
         f"Дата: {date} в {time}\n"
         f"Ссылка: {link}\n"
-        f"Чат публикации: {target_chat_id}\n\n"
-        f"Напоминания:\n{reminders_text}"
+        f"Чат публикации: <code>{target_chat_id}</code>\n\n"
+        f"Напоминания:\n{reminders_text}",
+        parse_mode="HTML",
+        reply_markup=main_menu_keyboard(),
+        disable_web_page_preview=True,
     )
     return ConversationHandler.END
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Отменено.")
+    await update.message.reply_text("Отменено.", reply_markup=main_menu_keyboard())
     return ConversationHandler.END
 
+
+# ---------------------------------------------------------------------------
+# /chatid — use in a group to get its ID
+# ---------------------------------------------------------------------------
+
+async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    await update.message.reply_text(
+        f"ID этого чата: <code>{chat.id}</code>",
+        parse_mode="HTML",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Legacy text commands (still work alongside buttons)
+# ---------------------------------------------------------------------------
 
 @owner_only
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = db_list(update.effective_chat.id)
     if not rows:
-        await update.message.reply_text("Нет запланированных трансляций.")
+        await update.message.reply_text("Нет запланированных трансляций.", reply_markup=main_menu_keyboard())
         return
 
     now = datetime.now(TIMEZONE)
-    lines = ["Трансляции:\n"]
+    lines = ["<b>Трансляции:</b>\n"]
     for row in rows:
-        id_, name, date, time, link, chat_id, target_chat_id, *sent = row
-        status = "впереди" if parse_dt(date, time) > now else "прошла"
+        id_, name, date, time, link, chat_id, target_chat_id, *_ = row
+        status = "впереди ✅" if parse_dt(date, time) > now else "прошла"
         lines.append(
             f"[{id_}] «{name}» — {date} в {time} ({status})\n"
-            f"Чат: {target_chat_id}\n"
+            f"Чат: <code>{target_chat_id}</code>\n"
             f"{link}\n"
         )
 
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=back_keyboard(),
+        disable_web_page_preview=True,
+    )
 
 
 @owner_only
 async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = db_list(update.effective_chat.id)
     if not rows:
-        await update.message.reply_text("Нет трансляций для удаления.")
+        await update.message.reply_text("Нет трансляций для удаления.", reply_markup=main_menu_keyboard())
         return
 
     keyboard = [
-        [InlineKeyboardButton(f"[{r[0]}] {r[1]} — {r[2]} {r[3]}", callback_data=f"del_{r[0]}")]
+        [InlineKeyboardButton(f"🗑 [{r[0]}] {r[1]} — {r[2]} {r[3]}", callback_data=f"del_{r[0]}")]
         for r in rows
     ]
-    keyboard.append([InlineKeyboardButton("Отмена", callback_data="del_cancel")])
+    keyboard.append([InlineKeyboardButton("◀️ Главное меню", callback_data="menu_back")])
     await update.message.reply_text(
         "Выберите трансляцию для удаления:",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
-
-
-async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "del_cancel":
-        await query.edit_message_text("Отменено.")
-        return
-
-    broadcast_id = int(query.data.removeprefix("del_"))
-    if db_delete(broadcast_id, update.effective_chat.id):
-        await query.edit_message_text(f"Трансляция #{broadcast_id} удалена.")
-    else:
-        await query.edit_message_text("Трансляция не найдена.")
 
 
 # ---------------------------------------------------------------------------
@@ -346,7 +511,10 @@ def main():
     app.job_queue.run_repeating(check_reminders, interval=300, first=10)
 
     conv = ConversationHandler(
-        entry_points=[CommandHandler("add", cmd_add)],
+        entry_points=[
+            CommandHandler("add", cmd_add),
+            CallbackQueryHandler(cb_menu_add, pattern="^menu_add$"),
+        ],
         states={
             NAME:       [MessageHandler(filters.TEXT & ~filters.COMMAND, step_name)],
             DATE:       [MessageHandler(filters.TEXT & ~filters.COMMAND, step_date)],
@@ -358,10 +526,23 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("chatid", cmd_chatid))
     app.add_handler(conv)
-    app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("list",   cmd_list))
     app.add_handler(CommandHandler("delete", cmd_delete))
-    app.add_handler(CallbackQueryHandler(delete_callback, pattern=r"^del_"))
+
+    # Inline button callbacks
+    app.add_handler(CallbackQueryHandler(cb_menu_list,   pattern="^menu_list$"))
+    app.add_handler(CallbackQueryHandler(cb_menu_delete, pattern="^menu_delete$"))
+    app.add_handler(CallbackQueryHandler(cb_menu_back,   pattern="^menu_back$"))
+    app.add_handler(CallbackQueryHandler(delete_callback, pattern=r"^del_\d+$"))
+
+    # #вопрос handler — any group/channel where bot is present
+    app.add_handler(MessageHandler(
+        (filters.Regex(r"(?i)#вопрос") | filters.CaptionRegex(r"(?i)#вопрос"))
+        & ~filters.ChatType.PRIVATE,
+        handle_question,
+    ))
 
     app.run_polling(drop_pending_updates=True)
 
