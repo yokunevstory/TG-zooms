@@ -4,7 +4,7 @@ import logging
 from datetime import datetime, timedelta
 from functools import wraps
 import pytz
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import BotCommand, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     filters, ContextTypes, ConversationHandler,
@@ -34,6 +34,7 @@ def init_db():
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
+        # Main broadcasts table
         conn.execute("""
             CREATE TABLE IF NOT EXISTS broadcasts (
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,15 +46,26 @@ def init_db():
                 target_chat_id INTEGER NOT NULL DEFAULT 0,
                 sent_morning   INTEGER NOT NULL DEFAULT 0,
                 sent_hour      INTEGER NOT NULL DEFAULT 0,
-                sent_15min     INTEGER NOT NULL DEFAULT 0
+                sent_15min     INTEGER NOT NULL DEFAULT 0,
+                sent_evening   INTEGER NOT NULL DEFAULT 0
             )
         """)
+        # Known chats registry (populated via /chatid and #вопрос)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS known_chats (
+                chat_id  INTEGER PRIMARY KEY,
+                title    TEXT,
+                username TEXT
+            )
+        """)
+        # Migrations for existing databases
         cols = [r[1] for r in conn.execute("PRAGMA table_info(broadcasts)").fetchall()]
         for col, definition in [
             ("target_chat_id", "INTEGER NOT NULL DEFAULT 0"),
             ("sent_morning",   "INTEGER NOT NULL DEFAULT 0"),
             ("sent_hour",      "INTEGER NOT NULL DEFAULT 0"),
             ("sent_15min",     "INTEGER NOT NULL DEFAULT 0"),
+            ("sent_evening",   "INTEGER NOT NULL DEFAULT 0"),
         ]:
             if col not in cols:
                 conn.execute(f"ALTER TABLE broadcasts ADD COLUMN {col} {definition}")
@@ -94,6 +106,23 @@ def db_delete(broadcast_id, chat_id) -> bool:
         return cur.rowcount > 0
 
 
+def db_save_chat(chat_id: int, title: str, username: str | None):
+    """Upsert a chat into the known_chats registry."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """INSERT INTO known_chats (chat_id, title, username) VALUES (?, ?, ?)
+               ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title, username=excluded.username""",
+            (chat_id, title, username),
+        )
+
+
+def db_known_chats() -> list:
+    with sqlite3.connect(DB_PATH) as conn:
+        return conn.execute(
+            "SELECT chat_id, title, username FROM known_chats ORDER BY title"
+        ).fetchall()
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -113,7 +142,6 @@ def owner_only(func):
 
 
 async def check_owner_cb(update: Update) -> bool:
-    """Returns True if caller is owner; silently rejects otherwise."""
     if update.effective_user.id == OWNER_ID:
         return True
     await update.callback_query.answer("Нет доступа.", show_alert=True)
@@ -144,6 +172,13 @@ def back_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def chat_label(chat_id: int, title: str | None, username: str | None) -> str:
+    label = title or str(chat_id)
+    if username:
+        label += f" (@{username})"
+    return label
+
+
 # ---------------------------------------------------------------------------
 # Reminder poller (runs every 5 minutes via JobQueue)
 # ---------------------------------------------------------------------------
@@ -153,7 +188,10 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     rows = db_all()
 
     for row in rows:
-        id_, name, date, time, link, chat_id, target_chat_id, sent_morning, sent_hour, sent_15min = row
+        (id_, name, date, time, link,
+         chat_id, target_chat_id,
+         sent_morning, sent_hour, sent_15min, sent_evening) = row
+
         broadcast_dt = parse_dt(date, time)
 
         reminders = [
@@ -177,6 +215,18 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
             ),
         ]
 
+        # Extra evening reminder the day before for morning broadcasts (before 12:00)
+        if broadcast_dt.hour < 12:
+            evening_dt = (broadcast_dt - timedelta(days=1)).replace(
+                hour=19, minute=0, second=0, microsecond=0
+            )
+            reminders.insert(0, (
+                evening_dt,
+                sent_evening,
+                "sent_evening",
+                f"Завтра трансляция «{name}» в {time}!\n{link}",
+            ))
+
         for reminder_dt, already_sent, col, text in reminders:
             if not already_sent and now >= reminder_dt:
                 try:
@@ -197,9 +247,11 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message or not chat:
         return
 
+    # Register this chat in the known chats list
+    db_save_chat(chat.id, chat.title or "", chat.username)
+
     chat_name = chat.title or chat.username or str(chat.id)
 
-    # Build a direct link to the message (works for public chats and supergroups)
     msg_link = None
     if chat.username:
         msg_link = f"https://t.me/{chat.username}/{message.message_id}"
@@ -255,10 +307,7 @@ async def cb_menu_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     rows = db_list(update.effective_chat.id)
     if not rows:
-        await query.edit_message_text(
-            "Нет запланированных трансляций.",
-            reply_markup=back_keyboard(),
-        )
+        await query.edit_message_text("Нет запланированных трансляций.", reply_markup=back_keyboard())
         return
 
     now = datetime.now(TIMEZONE)
@@ -288,10 +337,7 @@ async def cb_menu_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     rows = db_list(update.effective_chat.id)
     if not rows:
-        await query.edit_message_text(
-            "Нет трансляций для удаления.",
-            reply_markup=back_keyboard(),
-        )
+        await query.edit_message_text("Нет трансляций для удаления.", reply_markup=back_keyboard())
         return
 
     keyboard = [
@@ -318,10 +364,7 @@ async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=main_menu_keyboard(),
         )
     else:
-        await query.edit_message_text(
-            "Трансляция не найдена.",
-            reply_markup=main_menu_keyboard(),
-        )
+        await query.edit_message_text("Трансляция не найдена.", reply_markup=main_menu_keyboard())
 
 
 # ---------------------------------------------------------------------------
@@ -378,14 +421,51 @@ async def step_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def step_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["link"] = update.message.text.strip()
-    await update.message.reply_text(
-        "Введите ID чата для публикации напоминаний.\n\n"
-        "Не знаете ID? Напишите /chatid прямо в той группе/канале — бот пришлёт его."
+
+    known = db_known_chats()
+    if known:
+        keyboard = [
+            [InlineKeyboardButton(
+                chat_label(cid, title, username),
+                callback_data=f"pick_chat_{cid}",
+            )]
+            for cid, title, username in known
+        ]
+        keyboard.append([InlineKeyboardButton("✏️ Ввести ID вручную", callback_data="pick_chat_manual")])
+        await update.message.reply_text(
+            "Выберите чат для публикации напоминаний:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+    else:
+        await update.message.reply_text(
+            "Введите ID чата для публикации напоминаний.\n\n"
+            "Не знаете ID? Напишите /chatid прямо в той группе/канале — бот запомнит её."
+        )
+    return CHAT_INPUT
+
+
+async def cb_select_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User picked a known chat from the inline list."""
+    query = update.callback_query
+    await query.answer()
+    target_chat_id = int(query.data.removeprefix("pick_chat_"))
+    await query.edit_message_text(f"Чат выбран: <code>{target_chat_id}</code>", parse_mode="HTML")
+    await _finish_add(update.effective_chat.id, context, target_chat_id, context.bot, query.message)
+    return ConversationHandler.END
+
+
+async def cb_chat_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User wants to type the chat ID manually."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "Введите ID чата числом (например: -1001234567890):"
     )
     return CHAT_INPUT
 
 
 async def step_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fallback: user typed the chat ID manually."""
     message = update.message
     target_chat_id = extract_forwarded_chat_id(message)
 
@@ -398,11 +478,16 @@ async def step_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return CHAT_INPUT
 
+    await _finish_add(update.effective_chat.id, context, target_chat_id, context.bot, message)
+    return ConversationHandler.END
+
+
+async def _finish_add(owner_chat_id: int, context, target_chat_id: int, bot, reply_target):
+    """Save broadcast to DB and send confirmation."""
     name = context.user_data["name"]
     date = context.user_data["date"]
     time = context.user_data["time"]
     link = context.user_data["link"]
-    owner_chat_id = update.effective_chat.id
 
     db_add(name, date, time, link, owner_chat_id, target_chat_id)
 
@@ -410,6 +495,10 @@ async def step_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     broadcast_dt = parse_dt(date, time)
 
     reminders = []
+    if broadcast_dt.hour < 12:
+        ev = (broadcast_dt - timedelta(days=1)).replace(hour=19, minute=0, second=0, microsecond=0)
+        if ev > now:
+            reminders.append(f"• {ev.strftime('%d.%m в 19:00')} — накануне вечером")
     morning = broadcast_dt.replace(hour=9, minute=0, second=0, microsecond=0)
     if morning > now:
         reminders.append(f"• {morning.strftime('%d.%m в 09:00')} — утром")
@@ -420,18 +509,21 @@ async def step_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     reminders_text = "\n".join(reminders) if reminders else "нет (все напоминания уже прошли)"
 
-    await message.reply_text(
+    text = (
         f"✅ <b>Трансляция добавлена!</b>\n\n"
         f"Название: {name}\n"
         f"Дата: {date} в {time}\n"
         f"Ссылка: {link}\n"
         f"Чат публикации: <code>{target_chat_id}</code>\n\n"
-        f"Напоминания:\n{reminders_text}",
+        f"Напоминания:\n{reminders_text}"
+    )
+    await bot.send_message(
+        owner_chat_id,
+        text,
         parse_mode="HTML",
         reply_markup=main_menu_keyboard(),
         disable_web_page_preview=True,
     )
-    return ConversationHandler.END
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -440,11 +532,13 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# /chatid — use in a group to get its ID
+# /chatid — use in a group to get its ID (also registers the chat)
 # ---------------------------------------------------------------------------
 
 async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
+    if chat.type != "private":
+        db_save_chat(chat.id, chat.title or "", chat.username)
     await update.message.reply_text(
         f"ID этого чата: <code>{chat.id}</code>",
         parse_mode="HTML",
@@ -452,7 +546,7 @@ async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# Legacy text commands (still work alongside buttons)
+# Legacy text commands
 # ---------------------------------------------------------------------------
 
 @owner_only
@@ -500,13 +594,28 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
+# Bot command hints (shown when user types /)
+# ---------------------------------------------------------------------------
+
+async def post_init(application: Application):
+    await application.bot.set_my_commands([
+        BotCommand("start",  "Главное меню"),
+        BotCommand("add",    "Добавить трансляцию"),
+        BotCommand("list",   "Список трансляций"),
+        BotCommand("delete", "Удалить трансляцию"),
+        BotCommand("chatid", "Узнать ID этого чата"),
+        BotCommand("cancel", "Отменить текущее действие"),
+    ])
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 def main():
     init_db()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.job_queue.run_repeating(check_reminders, interval=300, first=10)
 
@@ -520,21 +629,25 @@ def main():
             DATE:       [MessageHandler(filters.TEXT & ~filters.COMMAND, step_date)],
             TIME_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, step_time)],
             LINK:       [MessageHandler(filters.TEXT & ~filters.COMMAND, step_link)],
-            CHAT_INPUT: [MessageHandler(filters.ALL & ~filters.COMMAND, step_chat)],
+            CHAT_INPUT: [
+                CallbackQueryHandler(cb_select_chat,  pattern=r"^pick_chat_-?\d+$"),
+                CallbackQueryHandler(cb_chat_manual,  pattern="^pick_chat_manual$"),
+                MessageHandler(filters.ALL & ~filters.COMMAND, step_chat),
+            ],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
     )
 
-    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("chatid", cmd_chatid))
     app.add_handler(conv)
     app.add_handler(CommandHandler("list",   cmd_list))
     app.add_handler(CommandHandler("delete", cmd_delete))
 
     # Inline button callbacks
-    app.add_handler(CallbackQueryHandler(cb_menu_list,   pattern="^menu_list$"))
-    app.add_handler(CallbackQueryHandler(cb_menu_delete, pattern="^menu_delete$"))
-    app.add_handler(CallbackQueryHandler(cb_menu_back,   pattern="^menu_back$"))
+    app.add_handler(CallbackQueryHandler(cb_menu_list,    pattern="^menu_list$"))
+    app.add_handler(CallbackQueryHandler(cb_menu_delete,  pattern="^menu_delete$"))
+    app.add_handler(CallbackQueryHandler(cb_menu_back,    pattern="^menu_back$"))
     app.add_handler(CallbackQueryHandler(delete_callback, pattern=r"^del_\d+$"))
 
     # #вопрос handler — any group/channel where bot is present
